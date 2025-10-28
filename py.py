@@ -49,6 +49,66 @@ def fetch_current_year_quarterly_data(conn):
     return df
 
 
+def fetch_last_year_monthly_data(conn, target_month=None):
+    """
+    Fetch last year's monthly incidents by barangay and incident type.
+    If target_month is specified, filter for that specific month.
+    """
+    month_condition = ""
+    if target_month and 1 <= target_month <= 12:
+        month_condition = f"AND MONTH(im.date_and_time_reported) = {target_month}"
+    
+    sql = (
+        "SELECT bt.bt_id, bt.barangay, bt.latitude, bt.longitude, "
+        "im.type_of_incident, "
+        "MONTH(im.date_and_time_reported) AS month, "
+        "DATE(im.date_and_time_reported) AS report_date, "
+        "HOUR(im.date_and_time_reported) AS report_hour, "
+        "COUNT(*) AS cnt "
+        "FROM incident_management im "
+        "JOIN place_of_incident poi ON poi.poi_id = im.poi_id "
+        "JOIN barangay_table bt ON bt.bt_id = poi.bt_id "
+        "WHERE im.category = 'Crime' "
+        "AND YEAR(im.date_and_time_reported) = YEAR(CURDATE()) - 1 "
+        f"{month_condition} "
+        "GROUP BY bt.bt_id, bt.barangay, bt.latitude, bt.longitude, im.type_of_incident, month, report_date, report_hour"
+    )
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["bt_id", "barangay", "latitude", "longitude", "type_of_incident", "month", "report_date", "report_hour", "cnt"])    
+    df = pd.DataFrame(rows)
+    return df
+
+
+def fetch_yearly_comparison_data(conn):
+    """
+    Fetch monthly incident counts for current year and previous year for comparison.
+    Returns data grouped by month for both years.
+    """
+    sql = (
+        "SELECT "
+        "YEAR(im.date_and_time_reported) AS year, "
+        "MONTH(im.date_and_time_reported) AS month, "
+        "COUNT(*) AS cnt "
+        "FROM incident_management im "
+        "JOIN place_of_incident poi ON poi.poi_id = im.poi_id "
+        "JOIN barangay_table bt ON bt.bt_id = poi.bt_id "
+        "WHERE im.category = 'Crime' "
+        "AND YEAR(im.date_and_time_reported) IN (YEAR(CURDATE()), YEAR(CURDATE()) - 1) "
+        "GROUP BY year, month "
+        "ORDER BY year, month"
+    )
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["year", "month", "cnt"])
+    df = pd.DataFrame(rows)
+    return df
+
+
 def convert_to_standard_time(hour):
     """
     Convert 24-hour format to 12-hour format with AM/PM.
@@ -223,6 +283,99 @@ def predict_current_quarter_incidents(df, bt_id, incident_type, prediction_quart
     return prediction  # Based on actual database data
 
 
+def predict_monthly_incidents(last_year_df, bt_id, incident_type, target_month):
+    """
+    Predict monthly incidents based on last year's data for the same month.
+    """
+    # Filter data for this barangay, incident type, and target month
+    monthly_data = last_year_df[(last_year_df['bt_id'] == bt_id) & 
+                               (last_year_df['type_of_incident'] == incident_type) & 
+                               (last_year_df['month'] == target_month)]
+    
+    print(f"DEBUG: Monthly prediction for bt_id={bt_id}, incident={incident_type}, month={target_month}", file=sys.stderr)
+    print(f"DEBUG: Last year monthly data found: {len(monthly_data)} records", file=sys.stderr)
+    
+    if monthly_data.empty:
+        print(f"DEBUG: No last year data for this month, returning 0", file=sys.stderr)
+        return 0
+    
+    # Calculate prediction based on last year's same month incidents
+    last_year_incidents = monthly_data['cnt'].sum()
+    print(f"DEBUG: Last year same month incidents: {last_year_incidents}", file=sys.stderr)
+    
+    # Simple prediction: assume similar pattern with slight variation
+    # Add some randomness based on historical patterns
+    prediction = int(last_year_incidents * 1.05)  # 5% increase assumption for monthly
+    
+    print(f"DEBUG: Calculated monthly prediction: {prediction}", file=sys.stderr)
+    return prediction
+
+
+def build_monthly_forecast(last_year_df, target_month=None):
+    """
+    Build monthly forecast based on last year's data.
+    If target_month is specified, filter for that specific month.
+    Otherwise, use all months.
+    """
+    results = []
+    
+    # Get month name
+    month_names = {1: 'January', 2: 'February', 3: 'March', 4: 'April', 5: 'May', 6: 'June',
+                   7: 'July', 8: 'August', 9: 'September', 10: 'October', 11: 'November', 12: 'December'}
+    
+    if target_month and target_month not in month_names:
+        print(json.dumps({"error": "Invalid target month"}))
+        return []
+    
+    if not last_year_df.empty:
+        # Filter by target month if specified
+        if target_month:
+            df_filtered = last_year_df[last_year_df['month'] == target_month].copy()
+            month_name = month_names[target_month]
+        else:
+            df_filtered = last_year_df
+            month_name = "All Months"
+        
+        if df_filtered.empty:
+            return []
+        
+        # Group by barangay and incident type
+        for (bt_id, incident_type), group in df_filtered.groupby(['bt_id', 'type_of_incident']):
+            barangay_data = group.iloc[0]  # Get barangay metadata
+            total_incidents = group['cnt'].sum()
+            
+            # Only predict if there were incidents in this month
+            if target_month:
+                # Predict incidents for this month based on last year's data
+                monthly_prediction = predict_monthly_incidents(last_year_df, bt_id, incident_type, target_month)
+            else:
+                # If no target month, use the total from filtered data
+                monthly_prediction = int(total_incidents)
+            
+            # Analyze hot hours for this barangay and incident type
+            hot_hours = analyze_hot_hours(last_year_df, bt_id, incident_type)
+            
+            # Calculate confidence based on historical data
+            confidence = 'high' if total_incidents >= 5 else 'medium' if total_incidents >= 2 else 'low'
+            
+            results.append({
+                'bt_id': int(bt_id),
+                'barangay': barangay_data['barangay'],
+                'latitude': float(barangay_data['latitude']) if not pd.isna(barangay_data['latitude']) else None,
+                'longitude': float(barangay_data['longitude']) if not pd.isna(barangay_data['longitude']) else None,
+                'type_of_incident': incident_type,
+                'target_month': target_month if target_month else 1,
+                'month_name': month_name if target_month else month_names[1],
+                'forecast_value': float(total_incidents),
+                'monthly_prediction': monthly_prediction,
+                'confidence': confidence,
+                'hot_hours': hot_hours,
+                'is_monthly': True
+            })
+    
+    return results
+
+
 def build_quarterly_arima_forecast(continuous_df, original_df):
     """
     Build simple forecast for continuous incidents by quarter using month-level data.
@@ -281,10 +434,37 @@ def build_quarterly_arima_forecast(continuous_df, original_df):
 
 
 def main():
+    # Check for command line arguments
+    mode = 'quarterly'  # default
+    target_period = None
+    
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+    if len(sys.argv) > 2:
+        target_period = int(sys.argv[2])
+    
+    df = pd.DataFrame()
+    comparison_df = pd.DataFrame()
+    
     try:
         conn = get_db_connection()
-        df = fetch_current_year_quarterly_data(conn)
-        print(f"DEBUG: Fetched {len(df)} records", file=sys.stderr)
+        
+        # For quarterly mode, use current year quarterly data
+        if mode == 'quarterly':
+            df = fetch_current_year_quarterly_data(conn)
+            print(f"DEBUG: Fetched {len(df)} records for quarterly", file=sys.stderr)
+        # For monthly mode, use last year monthly data
+        elif mode == 'monthly':
+            df = fetch_last_year_monthly_data(conn)
+            print(f"DEBUG: Fetched {len(df)} records for monthly", file=sys.stderr)
+        else:
+            print(json.dumps({"error": "Invalid mode"}))
+            sys.exit(1)
+        
+        # Fetch yearly comparison data for all modes
+        comparison_df = fetch_yearly_comparison_data(conn)
+        print(f"DEBUG: Fetched {len(comparison_df)} comparison records", file=sys.stderr)
+            
         if not df.empty:
             print(f"DEBUG: Sample data: {df.head().to_dict()}", file=sys.stderr)
     except Exception as e:
@@ -301,6 +481,63 @@ def main():
         print(json.dumps([]))
         return
 
+    if mode == 'monthly':
+        # Monthly forecasting based on last year
+        forecast_results = build_monthly_forecast(df, target_period)
+        print(f"DEBUG: Generated {len(forecast_results)} monthly forecasts", file=sys.stderr)
+        
+        # Group by barangay and output
+        barangay_groups = {}
+        for result in forecast_results:
+            bt_id = result['bt_id']
+            if bt_id not in barangay_groups:
+                barangay_groups[bt_id] = {
+                    "bt_id": result['bt_id'],
+                    "barangay": result['barangay'],
+                    "latitude": result['latitude'],
+                    "longitude": result['longitude'],
+                    "incident_types": [],
+                    "target_month": result['target_month'],
+                    "month_name": result['month_name'],
+                    "hot_hours": result['hot_hours'],
+                    "prediction_quarter": result.get('target_month', 1)  # Use month as quarter for monthly mode
+                }
+            
+            formatted_incident_type = result['type_of_incident'].replace(', ', ' with ')
+            incident_info = {
+                "type": formatted_incident_type,
+                "count": result['forecast_value'],
+                "current_quarter_prediction": result.get('monthly_prediction', 0)
+            }
+            if incident_info not in barangay_groups[bt_id]["incident_types"]:
+                barangay_groups[bt_id]["incident_types"].append(incident_info)
+        
+        outputs = []
+        for barangay_data in barangay_groups.values():
+            sorted_incidents = sorted(barangay_data["incident_types"], key=lambda x: x['count'], reverse=True)
+            
+            if len(sorted_incidents) == 1:
+                combined_incidents = sorted_incidents[0]["type"]
+            else:
+                combined_incidents = " with ".join([inc["type"] for inc in sorted_incidents])
+            
+            outputs.append({
+                "bt_id": barangay_data["bt_id"],
+                "barangay": barangay_data["barangay"],
+                "latitude": barangay_data["latitude"],
+                "longitude": barangay_data["longitude"],
+                "type_of_incident": combined_incidents,
+                "prediction_quarter": barangay_data["target_month"],
+                "quarter_period": barangay_data["month_name"],
+                "continuous_months": barangay_data["month_name"],
+                "hot_hours": barangay_data["hot_hours"],
+                "incident_details": sorted_incidents
+            })
+        
+        print(json.dumps(outputs))
+        return
+    
+    # Quarterly mode (original logic)
     # Detect continuous incidents
     continuous_df = detect_continuous_incidents(df)
     print(f"DEBUG: Found {len(continuous_df)} continuous incidents", file=sys.stderr)
@@ -372,7 +609,75 @@ def main():
             "incident_details": sorted_incidents  # Include detailed incident info for sorting
         })
 
-    print(json.dumps(outputs))
+    # Calculate aggregated statistics for charts
+    incident_type_counts = {}
+    top_hotspots = []
+    
+    for output in outputs:
+        # Count incident types for pie chart
+        types = output['type_of_incident'].split(' with ')
+        for inc_type in types:
+            if inc_type not in incident_type_counts:
+                incident_type_counts[inc_type] = 0
+            incident_type_counts[inc_type] += 1
+        
+        # Prepare hotspot data
+        total_predicted = 0
+        if output.get('incident_details') and isinstance(output['incident_details'], list):
+            total_predicted = sum([inc.get('current_quarter_prediction', 0) or 0 for inc in output['incident_details']])
+        
+        top_hotspots.append({
+            "barangay": output['barangay'],
+            "incident_type": output['type_of_incident'],
+            "predicted": total_predicted,
+            "hot_hours": output.get('hot_hours', 'N/A')
+        })
+    
+    # Sort hotspots by predicted count (descending)
+    top_hotspots.sort(key=lambda x: x['predicted'], reverse=True)
+    
+    # Process yearly comparison data for line chart
+    yearly_comparison = []
+    if not comparison_df.empty:
+        # Group by year and month
+        current_year = int(pd.Timestamp.now().year)
+        previous_year = current_year - 1
+        
+        # Initialize monthly data for both years
+        current_year_data = {month: 0 for month in range(1, 13)}
+        previous_year_data = {month: 0 for month in range(1, 13)}
+        
+        for _, row in comparison_df.iterrows():
+            year = int(row['year'])
+            month = int(row['month'])
+            count = int(row['cnt'])
+            
+            if year == current_year:
+                current_year_data[month] = count
+            elif year == previous_year:
+                previous_year_data[month] = count
+        
+        # Prepare data for line chart
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        
+        for month in range(1, 13):
+            yearly_comparison.append({
+                "month": month_names[month - 1],
+                "current_year": current_year_data[month],
+                "previous_year": previous_year_data[month]
+            })
+    
+    # Format output with aggregation data
+    final_output = {
+        "forecasts": outputs,
+        "statistics": {
+            "incident_type_counts": incident_type_counts,
+            "top_hotspots": top_hotspots[:10],  # Top 10 hotspots
+            "yearly_comparison": yearly_comparison  # Monthly comparison data
+        }
+    }
+    
+    print(json.dumps(final_output))
 
 
 if __name__ == "__main__":
